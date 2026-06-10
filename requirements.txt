@@ -1,0 +1,16 @@
+# CLUTCH SHOT - AI Defender Basketball Challenge
+# Tested with Python 3.11
+#
+# Version notes:
+# - mediapipe is pinned below 0.10.22 because newer releases removed the
+#   easy "solutions" Pose API this project uses.
+# - mediapipe needs numpy < 2, so opencv-python is pinned to a release
+#   that still supports numpy 1.x.
+
+mediapipe>=0.10.9,<0.10.22
+opencv-python>=4.9,<4.12
+numpy>=1.26,<2.0
+pygame>=2.5.0
+
+# Testing
+pytest>=8.0.0
