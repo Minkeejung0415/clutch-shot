@@ -1,27 +1,38 @@
 """
 GameManager: the rulebook of CLUTCH SHOT.
 
-Owns everything about one 60-second game: the clock, score, statistics,
-the defender on the court, the fatigue meter, and the resolution of
-every shot and fake. It consumes events from the MotionDetector and
-produces state for the UI to draw - it never touches the camera or
-Pygame itself, so it can be tested headlessly.
+Owns one 60-second game: the clock, score, statistics, the defender,
+the fatigue meter, the player's deception level, and the resolution of
+every move the classifier reports:
 
-Game flow:
-    START  --SPACE-->  PLAYING  --timer hits 0-->  GAME_OVER  --R--> START
+    dribble   -> defender shuffles (and can get crossed at max deception)
+    shot_fake -> defender may bite and leave his feet
+    stepback  -> instant separation; a shot inside 2 s is worth 3
+    shot      -> challenged by the defender, then one probability roll
+    layup     -> same, but the defender protects the rim harder
+
+"Deception" is how many DIFFERENT setup moves (dribble / fake /
+stepback) the player chained in the last few seconds (0-3). It feeds
+every defender reaction, so fooling him is genuinely about the
+player's ability, not just dice.
+
+This module never touches the camera or Pygame, so it runs headless in
+tests. Game flow:
+
+    START --SPACE--> PLAYING --clock hits 0--> GAME_OVER --R--> START
 """
 
 import random
 import time
 
 import config
-from game.defender import DefenderManager
+from game.defender import DefenderAI
 from game.scoring import (
+    BLOCKED,
+    OPEN,
     FatigueSystem,
-    compute_form_score,
-    form_label,
-    points_for_made_shot,
-    shot_probability,
+    attempt_probability,
+    points_for,
 )
 
 # Game phases.
@@ -29,32 +40,50 @@ STATE_START = "START"
 STATE_PLAYING = "PLAYING"
 STATE_GAME_OVER = "GAME_OVER"
 
+# Move names (mirror vision/motion_detector.py event types).
+MOVES = ("dribble", "layup", "shot", "shot_fake", "stepback")
+
 
 class GameManager:
     """Holds and advances all game state for one session."""
 
-    def __init__(self):
+    def __init__(self, difficulty=config.DEFAULT_DIFFICULTY):
+        self.difficulty = difficulty
         self.state = STATE_START
         self.reset()
 
     # ------------------------------------------------------------------
     def reset(self):
-        """Fresh game state (called on construction and on restart)."""
+        """Fresh game state (keeps the chosen difficulty)."""
         self.time_remaining = float(config.GAME_DURATION)
         self.score = 0
-        self.attempts = 0
+        self.attempts = 0       # shots + layups
         self.makes = 0
-        self.form_scores = []          # every attempt's form score
-        self.fatigue = FatigueSystem()
-        self.defenders = DefenderManager()
+        self.blocks_against = 0
+        self.move_counts = {move: 0 for move in MOVES}
 
-        # "Last shot" panel data for the dashboard.
-        self.last_form_score = None
+        self.fatigue = FatigueSystem()
+        self.defender = DefenderAI(self.difficulty)
+
+        # Recent setup moves for the deception level: (move type, time).
+        self._recent_moves = []
+        self._last_stepback = -999.0
+
+        # "Last attempt" panel data for the HUD.
         self.last_probability = None
-        self.last_result = None        # "MADE" / "MISSED" / None
+        self.last_result = None     # "MADE" / "MISSED" / "BLOCKED" / None
+
+        # Ball-flight animation info for the UI: set on every attempt.
+        # {"start": t, "kind": ..., "result": ..., "three": bool}
+        self.ball_flight = None
 
         # Action messages: list of (text, expires_at_timestamp).
         self.messages = []
+
+    def set_difficulty(self, difficulty):
+        """Pick a difficulty (start screen). Swaps in a new defender."""
+        self.difficulty = difficulty
+        self.defender = DefenderAI(difficulty)
 
     def start(self):
         """Begin a new game from the start or end screen."""
@@ -62,24 +91,25 @@ class GameManager:
         self.state = STATE_PLAYING
 
     # ------------------------------------------------------------------
-    # Stats helpers the UI reads
+    # Stats / HUD helpers
     # ------------------------------------------------------------------
     @property
     def shooting_pct(self):
-        """Field-goal percentage, 0-100."""
+        """Field-goal percentage over shots + layups, 0-100."""
         if self.attempts == 0:
             return 0.0
         return 100.0 * self.makes / self.attempts
 
-    @property
-    def average_form(self):
-        if not self.form_scores:
-            return 0.0
-        return sum(self.form_scores) / len(self.form_scores)
-
-    @property
-    def best_form(self):
-        return max(self.form_scores) if self.form_scores else 0.0
+    def deception_level(self):
+        """
+        0-3: how many DIFFERENT setup moves (dribble, fake, stepback)
+        the player used within the deception window. Chaining variety
+        is what makes the defender guessable - this is the "player
+        ability" input to every defender reaction.
+        """
+        cutoff = time.time() - config.DECEPTION_WINDOW
+        kinds = {move for move, t in self._recent_moves if t >= cutoff}
+        return len(kinds)
 
     def active_messages(self):
         """Messages that haven't expired yet, newest first."""
@@ -87,95 +117,137 @@ class GameManager:
         return [text for text, expires in reversed(self.messages) if expires > now]
 
     def _say(self, text):
-        """Queue an action message for the dashboard."""
+        """Queue an action message for the HUD."""
         self.messages.append((text, time.time() + config.MESSAGE_DURATION))
-        # Keep the list from growing forever during a long session.
         if len(self.messages) > 20:
             self.messages = self.messages[-20:]
+
+    def _remember_move(self, move, now):
+        """Track a setup move for the deception level."""
+        self._recent_moves.append((move, now))
+        cutoff = now - config.DECEPTION_WINDOW
+        self._recent_moves = [(m, t) for m, t in self._recent_moves if t >= cutoff]
 
     # ------------------------------------------------------------------
     # Per-frame update
     # ------------------------------------------------------------------
     def update(self, dt):
-        """Advance the clock, fatigue recovery, and defender behavior."""
+        """Advance the clock, fatigue recovery, and the defender."""
+        now = time.time()
+        # The defender keeps moving on every screen so the start screen
+        # already shows him pacing in front of the rim.
+        self.defender.update(dt, now)
+
         if self.state != STATE_PLAYING:
             return
 
         self.time_remaining -= dt
         self.fatigue.update(dt)
 
-        # Defenders rotate / change stance / announce the boss.
-        for message in self.defenders.update(dt, self.time_remaining):
-            self._say(message)
-
         if self.time_remaining <= 0:
             self.time_remaining = 0.0
             self.state = STATE_GAME_OVER
 
     # ------------------------------------------------------------------
-    # Motion events from the detector
+    # Move events from the classifier
     # ------------------------------------------------------------------
     def handle_motion_event(self, event):
-        """Route a MotionDetector event to the right resolver."""
+        """Route one classifier event to the right resolver."""
         if self.state != STATE_PLAYING or event is None:
             return
-        if event["type"] == "shot":
-            self._resolve_shot(event["metrics"])
-        elif event["type"] == "fake":
-            self._resolve_fake()
+        now = time.time()
+        kind = event["type"]
+        self.move_counts[kind] += 1
 
-    def _resolve_fake(self):
-        """The player pump-faked: see if the defender leaves their feet."""
-        if self.defenders.on_fake():
-            self._say("DEFENDER BIT ON THE FAKE!")
-        else:
-            self._say(f"{self.defenders.defender.display_name} stays down...")
+        if kind == "dribble":
+            self._remember_move("dribble", now)
+            crossed = self.defender.on_dribble(
+                event.get("hand", "right"), self.deception_level(), now
+            )
+            if crossed:
+                self._say("CROSSED HIM OVER!")
 
-    def _resolve_shot(self, metrics):
-        """
-        Score one detected shot, start to finish:
-
-        1. form score from the raw motion measurements
-        2. effective pressure (forced OPEN if the defender bit a fake)
-        3. final probability = base + form + pressure - fatigue + fake
-        4. ONE random roll decides make or miss
-        5. points + bonuses on a make, fatigue on every attempt
-        """
-        form = compute_form_score(metrics)
-
-        # The fake window is spent by this shot whether it goes in or not.
-        pressure = self.defenders.pressure_for_shot()
-        fake_active = self.defenders.consume_fake_window()
-
-        probability = shot_probability(form, pressure, self.fatigue.value, fake_active)
-        made = random.random() < probability
-
-        # Book-keeping shared by makes and misses.
-        self.attempts += 1
-        self.form_scores.append(form)
-        self.fatigue.add_shot()
-        self.last_form_score = form
-        self.last_probability = probability
-
-        if form >= config.FORM_EXCELLENT_THRESHOLD:
-            self._say("GREEN RELEASE!")
-
-        if made:
-            self.makes += 1
-            points, bonuses = points_for_made_shot(pressure, fake_active, form)
-            self.score += points
-            self.last_result = "MADE"
-            if bonuses:
-                self._say(f"SHOT MADE! +{points} ({', '.join(bonuses)})")
+        elif kind == "shot_fake":
+            self._remember_move("shot_fake", now)
+            if self.defender.on_fake(self.deception_level(), now):
+                self._say("DEFENDER BIT ON THE FAKE!")
             else:
-                self._say(f"SHOT MADE! +{points}")
-        else:
-            self.last_result = "MISSED"
-            self._say("MISSED!")
+                self._say("He stays down...")
 
-        # Console log mirrors the dashboard - handy for debugging.
+        elif kind == "stepback":
+            self._remember_move("stepback", now)
+            stumbled = self.defender.on_stepback(self.deception_level(), now)
+            self._last_stepback = now
+            self._say("STEPBACK - SPACE CREATED!")
+            if stumbled:
+                self._say("DEFENDER STUMBLES!")
+
+        elif kind in ("shot", "layup"):
+            self._resolve_attempt(kind, now)
+
+    # ------------------------------------------------------------------
+    def _resolve_attempt(self, kind, now):
+        """
+        Resolve a shot or layup, start to finish:
+
+        1. is it a stepback three? (shot within the window of a stepback)
+        2. the defender challenges: OPEN / CONTESTED / BLOCKED
+        3. BLOCKED ends it right there - no probability roll
+        4. otherwise ONE dice roll against attempt_probability()
+        """
+        deception = self.deception_level()
+        separation = self.defender.separation
+        is_three = kind == "shot" and (now - self._last_stepback) <= config.STEPBACK_SHOT_WINDOW
+
+        contest = self.defender.challenge(kind, deception, now)
+
+        self.attempts += 1
+        # Probability uses the fatigue you shot WITH; the attempt's own
+        # fatigue cost lands afterwards.
+        fatigue_before = self.fatigue.value
+        self.fatigue.add_shot()
+
+        if contest == BLOCKED:
+            self.blocks_against += 1
+            self.last_result = "BLOCKED"
+            self.last_probability = 0.0
+            self._say("REJECTED AT THE RIM!" if kind == "layup" else "BLOCKED!")
+        else:
+            probability = attempt_probability(
+                kind, contest, self.defender.profile["contest_penalty"],
+                separation, fatigue_before, is_three,
+            )
+            made = random.random() < probability
+            self.last_probability = probability
+
+            if made:
+                points = points_for(kind, is_three)
+                self.score += points
+                self.makes += 1
+                self.last_result = "MADE"
+                if kind == "layup":
+                    self._say(f"LAYUP GOOD! +{points}")
+                elif is_three:
+                    self._say(f"STEPBACK THREE! +{points}")
+                elif contest == OPEN:
+                    self._say(f"WIDE OPEN - SHOT MADE! +{points}")
+                else:
+                    self._say(f"SHOT MADE! +{points}")
+            else:
+                self.last_result = "MISSED"
+                self._say("LAYUP MISSED!" if kind == "layup" else "MISSED!")
+
+        # Ball-flight animation cue for the UI.
+        self.ball_flight = {
+            "start": now,
+            "kind": kind,
+            "result": self.last_result,
+            "three": is_three,
+        }
+
+        # Console log mirrors the HUD - handy for debugging.
         print(
-            f"[SHOT] form={form:5.1f} ({form_label(form)})  "
-            f"pressure={pressure:<13}  prob={probability:.2f}  "
-            f"fatigue={self.fatigue.value:5.1f}  -> {self.last_result}"
+            f"[{kind.upper():5}] contest={contest:<9} "
+            f"prob={self.last_probability:.2f} sep={separation:.1f} "
+            f"deception={deception} -> {self.last_result}"
         )

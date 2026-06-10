@@ -3,17 +3,17 @@ CLUTCH SHOT - Central configuration file.
 
 Every tunable value in the game lives here so gameplay can be balanced
 without touching the logic code. Constants are grouped by the system
-that uses them. All angle values are in DEGREES, all time values are in
-SECONDS, and all probabilities are values between 0.0 and 1.0 unless
-noted otherwise.
+that uses them. All time values are in SECONDS; positions and distances
+use MediaPipe's normalized coordinates (0.0-1.0 across the frame)
+unless noted otherwise.
 """
 
 # ==========================================================
 # PLAYER SETTINGS
 # ==========================================================
 
-# Which arm the player shoots with. Must be "right" or "left".
-# This decides which wrist/elbow/shoulder the motion detector watches.
+# Used by the --vision-check diagnostic overlay. The game itself watches
+# BOTH hands (dribble/layup work with either hand).
 DOMINANT_ARM = "right"
 
 # ==========================================================
@@ -23,214 +23,154 @@ DOMINANT_ARM = "right"
 # Total length of one game in seconds.
 GAME_DURATION = 60
 
-# When the boss defender enters, measured in seconds REMAINING.
-# Example: 15 means the boss shows up for the last 15 seconds.
-BOSS_ENTER_TIME_REMAINING = 15
+# Defender difficulty used until the player picks one on the start
+# screen (keys 1/2/3). Must be a key of DIFFICULTY_PROFILES below.
+DEFAULT_DIFFICULTY = "MEDIUM"
 
 # ==========================================================
 # CAMERA / POSE DETECTION SETTINGS
 # ==========================================================
 
 # Index passed to cv2.VideoCapture. 0 is usually the built-in webcam.
-# Try 1 or 2 if you have multiple cameras or a virtual camera installed.
 CAMERA_INDEX = 0
-
-# Requested capture resolution. The camera may pick the closest
-# supported size; the game scales the frame anyway.
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 
 # MediaPipe Pose confidence thresholds (0.0 - 1.0).
-# Higher = fewer false detections but pose may drop out more often.
 POSE_DETECTION_CONFIDENCE = 0.5
 POSE_TRACKING_CONFIDENCE = 0.5
 
-# MediaPipe model complexity: 0 = fastest, 1 = balanced, 2 = most accurate.
-# 1 is a good default for laptops.
-POSE_MODEL_COMPLEXITY = 1
+# MediaPipe model complexity: 0 = fastest, 1 = balanced, 2 = accurate.
+# 0 keeps latency low, which matters for fast move chains.
+POSE_MODEL_COMPLEXITY = 0
 
-# A landmark with visibility below this value is treated as "not visible".
-# Used to decide whether we can trust the player's pose this frame.
+# A landmark with visibility below this is treated as "not visible".
 MIN_LANDMARK_VISIBILITY = 0.5
 
 # ==========================================================
-# SHOT MOTION DETECTION (state machine thresholds)
+# MOTION CLASSIFICATION
 # ==========================================================
-# The detector watches the shooting-side elbow, wrist, knee and shoulder.
-# Note on coordinates: MediaPipe y-values are NORMALIZED (0.0 = top of
-# frame, 1.0 = bottom), so "moving up" means y is DECREASING.
+# The five moves are classified from hand height relative to the
+# shoulder line plus short timing windows. y is normalized with 0 at
+# the TOP of the frame, so "above the shoulder" means a SMALLER y.
 
-# --- LOADING phase (player dips before the shot) ---
-# Knee angle below this means the knees are considered "bent".
-# A perfectly straight leg is ~180 degrees.
-KNEE_BEND_ANGLE = 160
+# A wrist counts as "up" when it is this far above the shoulder line
+# (average of both shoulders' y). Small margin filters jitter.
+HANDS_UP_MARGIN = 0.02
 
-# Elbow angle below this during loading means the shooting arm is "cocked".
-ELBOW_LOADED_ANGLE = 110
+# SHOT: both hands up, held continuously for this long.
+SHOT_HOLD_TIME = 1.0
 
-# --- RELEASED phase (the actual shot) ---
-# Elbow angle above this at release counts as a fully extended arm.
-ELBOW_EXTENDED_ANGLE = 150
+# SHOT FAKE: both hands went up but came back below the shoulders in
+# less than this. (By definition the complement of SHOT_HOLD_TIME.)
+FAKE_MAX_TIME = 1.0
 
-# The shooting wrist must rise this far ABOVE the shoulder (in normalized
-# screen units) for the motion to count as a release. Small value because
-# y is normalized: 0.05 is about 5% of the frame height.
-WRIST_ABOVE_SHOULDER_MARGIN = 0.0
+# LAYUP: exactly one hand up for this long (the wait filters out the
+# split second where the second hand is still on its way up to a shot).
+LAYUP_CONFIRM_TIME = 0.25
 
-# Minimum upward wrist speed (normalized units per second) during RISING.
-# Filters out slow drifting of the arm.
-MIN_WRIST_RISE_SPEED = 0.15
+# DRIBBLE: a below-shoulder hand reversing vertical direction.
+DRIBBLE_MIN_SPEED = 0.25      # wrist speed (norm units/s) to count as moving
+DRIBBLE_MIN_AMPLITUDE = 0.035  # vertical travel needed between reversals
+DRIBBLE_MIN_INTERVAL = 0.12    # min seconds between two counted bounces
 
-# A shot only counts if the knees dipped below this angle at SOME point
-# before release. Deliberately generous (almost any dip qualifies) so the
-# game stays forgiving, while the real KNEE_BEND_ANGLE above is what
-# earns form points.
-SHOT_REQUIRED_KNEE_ANGLE = 174
-
-# --- state machine timeouts (seconds) ---
-# If the player loads up but never rises, give up and return to IDLE.
-LOADING_TIMEOUT = 3.0
-# If the wrist rises but never releases or comes back down, reset.
-RISING_TIMEOUT = 2.5
-
-# --- COOLDOWN ---
-# Seconds after a detected shot during which no new shot can start.
-SHOT_COOLDOWN = 1.5
-# Shorter cooldown after a FAKE so the follow-up shot can happen quickly.
-FAKE_COOLDOWN = 0.4
+# STEPBACK: the body moves AWAY from the camera, detected as the
+# shoulder width shrinking. Compare now vs ~STEPBACK_WINDOW seconds ago.
+STEPBACK_WINDOW = 0.45
+STEPBACK_SHRINK = 0.10        # width must shrink by 10%
+STEPBACK_COOLDOWN = 1.0       # min seconds between stepbacks
 
 # ==========================================================
-# SHOT FAKE DETECTION
+# DECEPTION / COMBOS
 # ==========================================================
+# Chaining DIFFERENT setup moves (dribble, fake, stepback) within this
+# window raises the player's "deception" level (0-3 distinct moves).
+# Deception makes the defender easier to fool and harder to block with.
+DECEPTION_WINDOW = 2.5
 
-# A fake = the wrist rose at least this much (normalized units) above its
-# idle height, but the player came back down WITHOUT extending the elbow.
-FAKE_MIN_WRIST_RISE = 0.08
-
-# If the elbow exceeded this angle, it's a real shot attempt, not a fake.
-FAKE_MAX_ELBOW_ANGLE = 140
-
-# After a successful fake, the player has this many seconds to take the
-# follow-up shot and earn the fake bonus.
-FAKE_FOLLOWUP_WINDOW = 2.0
+# A shot released within this many seconds of a stepback is a
+# STEPBACK SHOT and is worth 3 points instead of 2.
+STEPBACK_SHOT_WINDOW = 2.0
 
 # ==========================================================
-# FORM SCORE WEIGHTS (must sum to 1.0)
+# DEFENDER AI
 # ==========================================================
-# The form score (0-100) is a weighted average of five components.
-
-FORM_WEIGHT_ELBOW_EXTENSION = 0.30  # arm fully extended at release
-FORM_WEIGHT_KNEE_BEND = 0.20        # used the legs before the shot
-FORM_WEIGHT_VERTICAL_RISE = 0.20    # body/wrist rose during the shot
-FORM_WEIGHT_BALANCE = 0.15          # shoulders/hips level, no leaning
-FORM_WEIGHT_SMOOTHNESS = 0.15       # steady upward wrist movement
-
-# Form score bands used for feedback messages and the bonus point.
-FORM_EXCELLENT_THRESHOLD = 85   # +1 bonus point at or above this
-FORM_GOOD_THRESHOLD = 70
-FORM_DECENT_THRESHOLD = 50
-
-# --- How raw measurements map to 0.0-1.0 component scores ---
-# Elbow extension: linearly maps release elbow angle from MIN -> MAX
-# onto 0.0 -> 1.0 (a 170-degree arm at release = perfect extension).
-FORM_ELBOW_MIN_ANGLE = 120
-FORM_ELBOW_MAX_ANGLE = 170
-
-# Knee bend: the DEEPEST knee angle during loading. 130 degrees (a real
-# athletic dip) = full credit, 172 (basically standing) = no credit.
-FORM_KNEE_BEST_ANGLE = 130
-FORM_KNEE_WORST_ANGLE = 172
-
-# Vertical rise: how far the wrist rose above its idle height
-# (normalized units). Rising this much earns full credit.
-FORM_FULL_RISE = 0.25
-
-# Balance: average shoulder/hip tilt of this many degrees (or more)
-# during the shot scores zero; perfectly level scores 1.0.
-FORM_MAX_TILT = 25
-# Sideways drift of the hip center (normalized units) that zeroes the
-# drift half of the balance score.
-FORM_MAX_HIP_DRIFT = 0.15
-
-# ==========================================================
-# SHOT SUCCESS PROBABILITY
-# ==========================================================
-
-# Every shot starts from this probability before modifiers.
-BASE_SHOT_PROBABILITY = 0.25
-
-# form_bonus = form_score / FORM_BONUS_DIVISOR  (so 100 form = +0.5)
-FORM_BONUS_DIVISOR = 200
-
-# Defender pressure modifiers, keyed by pressure level name.
-PRESSURE_MODIFIERS = {
-    "OPEN": +0.15,
-    "LIGHT_CONTEST": -0.05,
-    "HEAVY_CONTEST": -0.20,
+# One live defender guards the rim. His skill comes entirely from the
+# difficulty profile; whether he falls for moves also depends on the
+# player's deception level.
+#
+# Profile fields:
+#   bite_base             chance to jump at a shot fake (deception 0)
+#   bite_deception_bonus  extra bite chance per deception level
+#   stumble_chance        chance a setup move at max deception makes him
+#                         stumble (off-balance, can't contest)
+#   block_shot            base chance to BLOCK a jump shot he contests
+#   block_layup           base chance to BLOCK a layup at the rim
+#   contest_penalty       probability taken off a contested attempt
+#   closing_speed         separation units recovered per second
+#   recover_time          seconds off-balance after landing from a jump
+#   shuffle_speed         lateral movement speed (court units/s, visual)
+DIFFICULTY_PROFILES = {
+    "EASY": {
+        "bite_base": 0.55, "bite_deception_bonus": 0.15, "stumble_chance": 0.35,
+        "block_shot": 0.08, "block_layup": 0.18, "contest_penalty": 0.15,
+        "closing_speed": 0.45, "recover_time": 1.3, "shuffle_speed": 1.2,
+    },
+    "MEDIUM": {
+        "bite_base": 0.35, "bite_deception_bonus": 0.12, "stumble_chance": 0.20,
+        "block_shot": 0.15, "block_layup": 0.30, "contest_penalty": 0.22,
+        "closing_speed": 0.75, "recover_time": 0.9, "shuffle_speed": 1.8,
+    },
+    "HARD": {
+        "bite_base": 0.16, "bite_deception_bonus": 0.10, "stumble_chance": 0.10,
+        "block_shot": 0.24, "block_layup": 0.42, "contest_penalty": 0.30,
+        "closing_speed": 1.10, "recover_time": 0.6, "shuffle_speed": 2.6,
+    },
 }
 
-# Extra probability for the follow-up shot after a defender bites a fake.
-FAKE_SHOT_BONUS = 0.10
+# How long the defender hangs in the air after biting a fake, and how
+# long his contest jump lasts. While airborne he cannot defend.
+DEFENDER_AIR_TIME = 0.55
+DEFENDER_CONTEST_TIME = 0.45
+DEFENDER_BEATEN_TIME = 0.8     # stumble duration after getting crossed
 
-# Final probability is clamped into this range so the game never feels
-# impossible or automatic.
+# Separation (distance the player creates, in abstract "steps").
+STEPBACK_SEPARATION = 1.0      # one stepback buys one step of space
+MAX_SEPARATION = 2.5
+OPEN_SEPARATION = 1.6          # at this much space a jump shot is OPEN
+BLOCK_SEPARATION_PENALTY = 0.08  # block chance lost per step of space
+BLOCK_DECEPTION_PENALTY = 0.04   # block chance lost per deception level
+
+# ==========================================================
+# ATTEMPT RESOLUTION (make / miss / block)
+# ==========================================================
+
+LAYUP_BASE_PROB = 0.80    # layups are easy... if they don't get blocked
+SHOT_BASE_PROB = 0.62     # neutral jump shot
+OPEN_BONUS = 0.15         # defender airborne / beaten / too far away
+THREE_PENALTY = 0.12      # stepback threes are longer shots
+SEPARATION_PROB_BONUS = 0.05   # per step of space (capped at 2 steps)
+
+# Final make probability is clamped into this range.
 MIN_SHOT_PROBABILITY = 0.05
-MAX_SHOT_PROBABILITY = 0.90
+MAX_SHOT_PROBABILITY = 0.95
 
 # ==========================================================
-# DEFENDER SYSTEM
-# ==========================================================
-# Each defender type has a personality expressed as probabilities:
-# - pressure_weights: chance of each stance when pressure is re-rolled
-#   (weights are relative; they're normalized when used)
-# - fake_bite_chance: chance this defender jumps on a shot fake
-DEFENDER_PROFILES = {
-    "LAZY_DEFENDER": {
-        "display_name": "Lazy Defender",
-        "pressure_weights": {"OPEN": 0.60, "LIGHT_CONTEST": 0.30, "HEAVY_CONTEST": 0.10},
-        "fake_bite_chance": 0.50,
-    },
-    "AGGRESSIVE_GUARD": {
-        "display_name": "Aggressive Guard",
-        "pressure_weights": {"OPEN": 0.15, "LIGHT_CONTEST": 0.35, "HEAVY_CONTEST": 0.50},
-        "fake_bite_chance": 0.70,
-    },
-    "DISCIPLINED_DEFENDER": {
-        "display_name": "Disciplined Defender",
-        "pressure_weights": {"OPEN": 0.25, "LIGHT_CONTEST": 0.50, "HEAVY_CONTEST": 0.25},
-        "fake_bite_chance": 0.25,
-    },
-    "BOSS_DEFENDER": {
-        "display_name": "BOSS Defender",
-        "pressure_weights": {"OPEN": 0.10, "LIGHT_CONTEST": 0.30, "HEAVY_CONTEST": 0.60},
-        "fake_bite_chance": 0.15,
-    },
-}
-
-# Regular defenders rotate out after this many seconds on the court.
-DEFENDER_ROTATION_INTERVAL = 12
-
-# How often the current defender re-decides its pressure stance.
-PRESSURE_REROLL_INTERVAL = 3.0
-
-# ==========================================================
-# SCORING (points)
+# POINTS
 # ==========================================================
 
-POINTS_MADE_SHOT = 2        # any made shot
-BONUS_OPEN_SHOT = 1         # made shot while OPEN
-BONUS_AFTER_FAKE = 1        # made shot inside the fake follow-up window
-BONUS_EXCELLENT_FORM = 1    # made shot with form >= FORM_EXCELLENT_THRESHOLD
+POINTS_LAYUP = 2
+POINTS_SHOT = 2
+POINTS_STEPBACK_SHOT = 3
 
 # ==========================================================
 # FATIGUE SYSTEM (0 - 100 scale)
 # ==========================================================
 
 FATIGUE_MAX = 100
-FATIGUE_PER_SHOT = 12          # fatigue added on every shot ATTEMPT
+FATIGUE_PER_SHOT = 12          # fatigue added per shot/layup attempt
 FATIGUE_RECOVERY_PER_SEC = 4   # fatigue removed per second of rest
 
-# How fatigue converts to a probability penalty:
 # fatigue_penalty = (fatigue / 100) * FATIGUE_MAX_PENALTY
 FATIGUE_MAX_PENALTY = 0.15
 
@@ -242,14 +182,17 @@ WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 TARGET_FPS = 30
 
-# How long an action message ("SHOT MADE!", ...) stays on screen.
-MESSAGE_DURATION = 2.5
+# How long an action message ("BLOCKED!", ...) stays on screen.
+MESSAGE_DURATION = 2.2
 
 # Basketball-themed color palette (RGB tuples for Pygame).
-COLOR_BACKGROUND = (18, 18, 24)      # near-black court
+COLOR_BACKGROUND = (18, 18, 24)      # near-black
 COLOR_ACCENT = (255, 140, 0)         # basketball orange
 COLOR_TEXT = (245, 245, 245)         # white
 COLOR_TEXT_DIM = (160, 160, 160)     # gray for labels
 COLOR_SUCCESS = (60, 200, 90)        # made shot green
-COLOR_FAIL = (220, 60, 60)           # missed shot red
-COLOR_WARNING = (250, 200, 60)       # contest warning yellow
+COLOR_FAIL = (220, 60, 60)           # missed/blocked red
+COLOR_WARNING = (250, 200, 60)       # yellow
+COLOR_COURT = (52, 38, 28)           # hardwood floor
+COLOR_COURT_LINES = (110, 90, 70)    # court markings
+COLOR_DEFENDER = (200, 50, 60)       # defender's jersey

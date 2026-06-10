@@ -1,164 +1,169 @@
 """
-Virtual defender system.
+The live defender.
 
-No machine learning here - each defender is a personality made of two
-probabilities (defined in config.DEFENDER_PROFILES):
+One animated defender stands between the player and the rim and reacts
+to every move the classifier detects:
 
-  - pressure_weights: how often it plays OPEN / LIGHT_CONTEST /
-    HEAVY_CONTEST when it re-decides its stance
-  - fake_bite_chance: how easily it jumps on a shot fake
+  - DRIBBLE   he shuffles laterally to stay in front of the ball; a
+              dribble thrown at max deception can cross him over
+  - SHOT FAKE he may leave his feet (bite) - while airborne and while
+              recovering from the landing he cannot defend anything
+  - STEPBACK  the player buys separation; the defender closes it back
+              down over time at his profile's closing speed
+  - SHOT /    if he is on his feet and close enough he leaps to
+    LAYUP     contest: either he BLOCKS it outright (one dice roll) or
+              the attempt is merely CONTESTED (probability penalty)
 
-The DefenderManager rotates regular defenders during the game and sends
-in the BOSS_DEFENDER for the final stretch.
+Whether he falls for anything is driven by exactly two inputs, as the
+design demands: the difficulty profile (config.DIFFICULTY_PROFILES) and
+the player's deception level (how well they chained setup moves).
+
+The class also exposes everything the UI needs to draw him: lateral
+position, jump height, current state, and separation.
 """
 
 import random
 
 import config
+from game.scoring import BLOCKED, CONTESTED, OPEN
 
-# The three pressure stances, ordered from easiest to hardest to shoot over.
-PRESSURE_LEVELS = ("OPEN", "LIGHT_CONTEST", "HEAVY_CONTEST")
-
-# Regular rotation - the boss is excluded and enters on a timer instead.
-ROTATION_TYPES = ("LAZY_DEFENDER", "AGGRESSIVE_GUARD", "DISCIPLINED_DEFENDER")
-
-
-class Defender:
-    """One defender with a fixed personality from config."""
-
-    def __init__(self, type_name):
-        self.type_name = type_name
-        profile = config.DEFENDER_PROFILES[type_name]
-        self.display_name = profile["display_name"]
-        self._pressure_weights = profile["pressure_weights"]
-        self._fake_bite_chance = profile["fake_bite_chance"]
-
-    def roll_pressure(self):
-        """Pick a pressure stance using this defender's weights."""
-        levels = list(self._pressure_weights.keys())
-        weights = list(self._pressure_weights.values())
-        return random.choices(levels, weights=weights, k=1)[0]
-
-    def bites_on_fake(self):
-        """Dice roll: does this defender jump on the player's pump fake?"""
-        return random.random() < self._fake_bite_chance
-
-    @property
-    def is_boss(self):
-        return self.type_name == "BOSS_DEFENDER"
+# Defender states (also used by the UI to pick the pose to draw).
+GUARD = "GUARD"          # on his feet, defending
+IN_AIR = "IN_AIR"        # jumped at a fake - helpless until he lands
+CONTEST = "CONTEST"      # leaping at a real shot/layup
+RECOVER = "RECOVER"      # just landed, regaining balance
+BEATEN = "BEATEN"        # crossed over / stumbling
 
 
-class DefenderManager:
-    """
-    Owns the defender currently on the court.
+class DefenderAI:
+    """A single defender whose skill comes from a difficulty profile."""
 
-    Responsibilities:
-    - rotate a new random regular defender every
-      DEFENDER_ROTATION_INTERVAL seconds
-    - re-roll the current defender's pressure stance every
-      PRESSURE_REROLL_INTERVAL seconds
-    - bring in the BOSS_DEFENDER when time_remaining drops below
-      BOSS_ENTER_TIME_REMAINING (the boss then stays until the buzzer)
-    - track the "defender bit on a fake" window, during which the next
-      shot is treated as wide OPEN
-    """
+    def __init__(self, difficulty=config.DEFAULT_DIFFICULTY):
+        self.difficulty = difficulty
+        self.profile = config.DIFFICULTY_PROFILES[difficulty]
 
-    def __init__(self):
-        self.defender = Defender(random.choice(ROTATION_TYPES))
-        self.pressure = self.defender.roll_pressure()
-        self._rotation_timer = 0.0
-        self._reroll_timer = 0.0
-        self._boss_announced = False
+        self.state = GUARD
+        self._state_until = 0.0   # when the current timed state ends
 
-        # > 0 means a defender recently bit on a fake; counts down in
-        # update(). While positive, the next shot is OPEN + fake bonus.
-        self.fake_window = 0.0
+        # Visual/positional state the UI reads every frame.
+        self.x = 0.0              # lateral position, -1 (left) .. +1 (right)
+        self._x_target = 0.0      # where he's shuffling toward
+        self.jump = 0.0           # 0 grounded .. 1 top of his jump
+        self.separation = 0.0     # space the player has, in "steps"
 
     # ------------------------------------------------------------------
-    def update(self, dt, time_remaining):
-        """
-        Advance defender behavior by one frame.
+    def update(self, dt, now):
+        """Advance timers, jump animation, shuffling, and closeouts."""
+        # Timed states expire into the next logical state.
+        if self.state in (IN_AIR, CONTEST) and now >= self._state_until:
+            # He landed: briefly off-balance before guarding again.
+            self.state = RECOVER
+            self._state_until = now + self.profile["recover_time"]
+        elif self.state in (RECOVER, BEATEN) and now >= self._state_until:
+            self.state = GUARD
 
-        Returns a list of action-message strings for the UI (possibly
-        empty), e.g. ["BOSS DEFENDER ENTERS!"].
-        """
-        messages = []
-        self.fake_window = max(0.0, self.fake_window - dt)
+        # Jump height eases toward 1 in the air, back to 0 on the ground.
+        target_jump = 1.0 if self.state in (IN_AIR, CONTEST) else 0.0
+        self.jump += (target_jump - self.jump) * min(1.0, 12.0 * dt)
 
-        # Boss entrance overrides normal rotation for the endgame.
-        if (
-            not self._boss_announced
-            and time_remaining <= config.BOSS_ENTER_TIME_REMAINING
-        ):
-            self.defender = Defender("BOSS_DEFENDER")
-            self.pressure = self.defender.roll_pressure()
-            self._boss_announced = True
-            self._rotation_timer = 0.0
-            self._reroll_timer = 0.0
-            messages.append("BOSS DEFENDER ENTERS!")
-            return messages
+        # Lateral shuffle toward wherever the ball pulled him.
+        max_step = self.profile["shuffle_speed"] * dt
+        delta = self._x_target - self.x
+        self.x += max(-max_step, min(max_step, delta))
 
-        # Regular defenders sub in and out on a timer (boss never leaves).
-        if not self.defender.is_boss:
-            self._rotation_timer += dt
-            if self._rotation_timer >= config.DEFENDER_ROTATION_INTERVAL:
-                self._rotation_timer = 0.0
-                # Pick a different defender than the current one so the
-                # rotation is always visible to the player.
-                choices = [t for t in ROTATION_TYPES if t != self.defender.type_name]
-                self.defender = Defender(random.choice(choices))
-                messages.extend(self._set_pressure(self.defender.roll_pressure()))
-                return messages
-
-        # The defender periodically re-decides how tight to play.
-        self._reroll_timer += dt
-        if self._reroll_timer >= config.PRESSURE_REROLL_INTERVAL:
-            self._reroll_timer = 0.0
-            messages.extend(self._set_pressure(self.defender.roll_pressure()))
-
-        return messages
-
-    def _set_pressure(self, new_pressure):
-        """Update the stance; announce it only when it actually changes."""
-        messages = []
-        if new_pressure != self.pressure:
-            if new_pressure == "HEAVY_CONTEST":
-                messages.append("HEAVY CONTEST!")
-            elif new_pressure == "OPEN":
-                messages.append("OPEN LOOK!")
-        self.pressure = new_pressure
-        return messages
+        # A defender on his feet works to erase the player's separation.
+        if self.state == GUARD:
+            self.separation = max(
+                0.0, self.separation - self.profile["closing_speed"] * dt
+            )
 
     # ------------------------------------------------------------------
-    def on_fake(self):
+    # Reactions to the player's setup moves
+    # ------------------------------------------------------------------
+    def on_dribble(self, hand, deception, now):
         """
-        The player threw a pump fake. Roll whether the defender bites.
+        Follow the ball side to side. A dribble thrown while the player
+        is at full deception can shake him completely (a crossover).
 
-        Returns True if the defender bit (the fake window opens and the
-        next shot inside it is treated as OPEN with a probability bonus).
+        Returns True if the defender stumbled.
         """
-        if self.defender.bites_on_fake():
-            self.fake_window = config.FAKE_FOLLOWUP_WINDOW
+        # Mirror view: the player's right-hand dribble pulls the
+        # defender toward the screen's right side.
+        self._x_target = 0.6 if hand == "right" else -0.6
+
+        if self.state == GUARD and deception >= 3:
+            if random.random() < self.profile["stumble_chance"]:
+                self.state = BEATEN
+                self._state_until = now + config.DEFENDER_BEATEN_TIME
+                return True
+        return False
+
+    def on_fake(self, deception, now):
+        """
+        The player pump-faked. A defender already in the air, recovering
+        or beaten can't bite again. Bite chance rises with deception.
+
+        Returns True if he bit (left his feet).
+        """
+        if self.state != GUARD:
+            return False
+        chance = (
+            self.profile["bite_base"]
+            + deception * self.profile["bite_deception_bonus"]
+        )
+        if random.random() < chance:
+            self.state = IN_AIR
+            self._state_until = now + config.DEFENDER_AIR_TIME
             return True
         return False
 
-    def pressure_for_shot(self):
+    def on_stepback(self, deception, now):
         """
-        The stance that applies to a shot taken RIGHT NOW.
+        The player stepped back: instant separation. At high deception
+        the sudden move can also make the defender stumble.
 
-        Inside the fake window the defender is in the air / out of
-        position, so the shot is wide open regardless of normal stance.
+        Returns True if he stumbled.
         """
-        if self.fake_window > 0:
-            return "OPEN"
-        return self.pressure
-
-    def consume_fake_window(self):
-        """
-        Spend the fake bonus on this shot (so one bite = one boosted
-        shot). Returns True if a fake bonus was active.
-        """
-        if self.fake_window > 0:
-            self.fake_window = 0.0
-            return True
+        self.separation = min(
+            config.MAX_SEPARATION, self.separation + config.STEPBACK_SEPARATION
+        )
+        if self.state == GUARD and deception >= 2:
+            if random.random() < self.profile["stumble_chance"]:
+                self.state = BEATEN
+                self._state_until = now + config.DEFENDER_BEATEN_TIME
+                return True
         return False
+
+    # ------------------------------------------------------------------
+    # Challenging a real attempt
+    # ------------------------------------------------------------------
+    def challenge(self, kind, deception, now):
+        """
+        The player released a shot or went up for a layup. Decide how
+        the defense affects it.
+
+        Returns one of scoring.OPEN / CONTESTED / BLOCKED:
+          OPEN      he physically can't contest (airborne from a fake,
+                    recovering, beaten, or - for jump shots - left too
+                    far behind by stepbacks)
+          BLOCKED   he contested AND won his block dice roll
+          CONTESTED he got a hand up but didn't get the ball
+        """
+        if self.state != GUARD:
+            return OPEN
+        if kind == "shot" and self.separation >= config.OPEN_SEPARATION:
+            return OPEN
+
+        # He leaps to contest (visual: the UI sees CONTEST and animates).
+        self.state = CONTEST
+        self._state_until = now + config.DEFENDER_CONTEST_TIME
+
+        base = self.profile["block_layup"] if kind == "layup" else self.profile["block_shot"]
+        block_chance = (
+            base
+            - self.separation * config.BLOCK_SEPARATION_PENALTY
+            - deception * config.BLOCK_DECEPTION_PENALTY
+        )
+        if random.random() < max(0.0, block_chance):
+            return BLOCKED
+        return CONTESTED

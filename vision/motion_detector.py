@@ -1,244 +1,271 @@
 """
-Shot-motion state machine.
+Real-time move classifier for the five moves of CLUTCH SHOT.
 
-Watches the player's joints frame by frame and decides when a SHOT or a
-SHOT FAKE happened. The states mirror a real jump shot:
+The rules (all relative to the player's shoulder line):
 
-    IDLE      standing normally
-    LOADING   knees bend / shooting elbow cocks (the "dip")
-    RISING    wrist and elbow drive upward
-    RELEASED  wrist above the shoulder with the arm extended -> SHOT!
-    COOLDOWN  short lockout so one motion only counts once
+  DRIBBLE   one hand BELOW the shoulders bouncing up and down
+  LAYUP     exactly one hand ABOVE the shoulders (held a split second)
+  SHOT      BOTH hands above the shoulders, held over 1 second
+  SHOT FAKE both hands went up but came back below in under 1 second
+  STEPBACK  the body moves backwards (away from the camera)
 
-A FAKE is a rise that comes back DOWN without the elbow ever extending:
-the player pumped the ball but didn't let it go.
+Unlike a slow multi-stage state machine, this classifier evaluates
+every rule on every frame so moves chain instantly: a fake can flow
+into a dribble into a stepback into a shot with no dead time. The only
+intentional waits are the ones the rules themselves define (the 1 s
+shot hold, and a 0.25 s confirmation so a layup isn't fired while the
+second hand is still on its way up to a shot).
 
-The detector only RECOGNIZES motion; it does not score it. When a shot
-is detected it returns an event carrying the raw measurements
-(release elbow angle, deepest knee bend, wrist rise, balance samples)
-and game/scoring.py turns those into a 0-100 form score.
+update() returns a LIST of events because two moves can legitimately
+happen in the same frame (e.g. a stepback while dribbling).
 
 Coordinate reminder: MediaPipe y is normalized with 0 at the TOP of the
-frame, so "the wrist moved up" means its y value DECREASED.
+frame, so "above the shoulders" means a SMALLER y value.
 """
 
+from collections import deque
+
 import config
-from vision.biomechanics import calculate_angle, midpoint, tilt_degrees
 
-# State names as constants so typos fail loudly instead of silently.
-IDLE = "IDLE"
-LOADING = "LOADING"
-RISING = "RISING"
-RELEASED = "RELEASED"
-COOLDOWN = "COOLDOWN"
+# Event type names.
+DRIBBLE = "dribble"
+LAYUP = "layup"
+SHOT = "shot"
+SHOT_FAKE = "shot_fake"
+STEPBACK = "stepback"
 
 
-class MotionDetector:
-    """Turns a stream of pose frames into SHOT / FAKE events."""
+class MotionClassifier:
+    """Turns a stream of pose frames into instant move events."""
 
     def __init__(self):
-        # Which side of the body to watch ("right" or "left").
-        self.side = config.DOMINANT_ARM
+        self.reset()
 
-        self.state = IDLE
-        self._state_since = 0.0       # timestamp of the last state change
-        self._cooldown_length = config.SHOT_COOLDOWN
+    def reset(self):
+        """Clear all temporal state (called on game restart)."""
+        # --- shot / fake: the "raise episode" -------------------------
+        # An episode starts when both hands first go up and ends when
+        # both are back below the shoulders.
+        self._episode_start = None    # when both hands FIRST went up
+        self._both_up_since = None    # continuous both-up stretch start
+        self._shot_fired = False      # shot already emitted this episode
 
-        # Slow-moving baseline of the wrist height while standing still.
-        # Wrist rise during a shot is measured against this.
-        self._idle_wrist_y = None
+        # --- layup -----------------------------------------------------
+        self._one_up_since = None     # when exactly-one-hand-up started
+        self._layup_fired = False     # blocks repeats until hand drops
 
-        # Previous-frame values for measuring movement speed.
-        self._prev_wrist_y = None
+        # --- dribble (tracked per hand) --------------------------------
+        self._dribble = {
+            "left": {"last_y": None, "dir": 0, "flip_y": None, "last_bounce": 0.0},
+            "right": {"last_y": None, "dir": 0, "flip_y": None, "last_bounce": 0.0},
+        }
+
+        # --- stepback ---------------------------------------------------
+        self._width_history = deque()  # (time, shoulder width) samples
+        self._stepback_ready_at = 0.0  # cooldown gate
+
         self._prev_time = None
-
-        self._reset_motion_data()
-
-    # ------------------------------------------------------------------
-    # Per-attempt measurement buffers
-    # ------------------------------------------------------------------
-    def _reset_motion_data(self):
-        """Clear the measurements collected during one shot attempt."""
-        self._min_knee_angle = 180.0   # deepest knee bend seen (LOADING+)
-        self._max_elbow_angle = 0.0    # most extended the elbow got
-        self._peak_wrist_rise = 0.0    # highest the wrist got above idle
-        self._rise_up_frames = 0       # RISING frames where wrist moved up
-        self._rise_total_frames = 0    # all RISING frames (for smoothness)
-        self._tilt_samples = []        # body tilt during the motion
-        self._start_hip_x = None       # hip x when the attempt began
-        self._max_hip_drift = 0.0      # biggest sideways slide of the hips
-
-    def _change_state(self, new_state, now):
-        self.state = new_state
-        self._state_since = now
+        # Snapshot for the UI (posture text + shot charge meter).
+        self._status = {"posture": "NO PLAYER", "shot_progress": 0.0}
 
     # ------------------------------------------------------------------
-    # Main entry point - call once per frame
+    def status(self):
+        """Live posture info for the UI: posture text and 0-1 progress
+        of the current shot hold (drives the on-screen charge bar)."""
+        return self._status
+
     # ------------------------------------------------------------------
     def update(self, joints, now):
         """
-        Advance the state machine by one frame.
+        Classify one frame.
 
         Args:
             joints: dict of joint name -> (x, y, visibility) from
                     PoseTracker.process(), or None if no player visible.
-            now:    current time in seconds (e.g. time.time()).
+            now:    current time in seconds.
 
         Returns:
-            None, or an event dict:
-              {"type": "shot", "metrics": {...}}  - a completed shot
-              {"type": "fake"}                    - a detected shot fake
+            list of event dicts, e.g. [{"type": "dribble", "hand": "left"}].
+            Usually empty or one event; rarely two in the same frame.
         """
-        # COOLDOWN ticks down even if the player leaves the frame.
-        if self.state == COOLDOWN:
-            if now - self._state_since >= self._cooldown_length:
-                self._change_state(IDLE, now)
-            return None
-
         if joints is None:
-            # Lost the player mid-motion: abandon the attempt safely.
-            if self.state != IDLE:
-                self._change_state(IDLE, now)
-            self._prev_wrist_y = None
-            self._prev_time = None
-            return None
+            # Player left the frame: drop transient motion state but keep
+            # cooldowns so re-entering the frame can't spam events.
+            self._episode_start = None
+            self._both_up_since = None
+            self._one_up_since = None
+            for hand in self._dribble.values():
+                hand["last_y"] = None
+                hand["dir"] = 0
+            self._width_history.clear()
+            self._prev_time = now
+            self._status = {"posture": "NO PLAYER", "shot_progress": 0.0}
+            return []
 
-        # ---- Measure everything we need this frame -------------------
-        side = self.side
-        wrist = joints[f"{side}_wrist"]
-        elbow = joints[f"{side}_elbow"]
-        shoulder = joints[f"{side}_shoulder"]
-
-        # Elbow angle: shoulder -> elbow -> wrist (180 = straight arm).
-        elbow_angle = calculate_angle(shoulder, elbow, wrist)
-        # Knee angle on the shooting side: hip -> knee -> ankle.
-        knee_angle = calculate_angle(
-            joints[f"{side}_hip"], joints[f"{side}_knee"], joints[f"{side}_ankle"]
-        )
-        # Balance inputs: how level the shoulders/hips are, and how far
-        # the body center slides sideways during the motion.
-        shoulder_tilt = tilt_degrees(joints["left_shoulder"], joints["right_shoulder"])
-        hip_tilt = tilt_degrees(joints["left_hip"], joints["right_hip"])
-        hip_center = midpoint(joints["left_hip"], joints["right_hip"])
-
-        # Upward wrist speed in normalized units/second (positive = up).
-        wrist_speed_up = 0.0
-        if self._prev_wrist_y is not None and self._prev_time is not None:
-            dt = now - self._prev_time
-            if dt > 0:
-                wrist_speed_up = (self._prev_wrist_y - wrist[1]) / dt
-        self._prev_wrist_y = wrist[1]
+        dt = (now - self._prev_time) if self._prev_time is not None else 0.0
         self._prev_time = now
 
-        event = None
+        # ---- shared per-frame features --------------------------------
+        # The shoulder line: average height of both shoulders.
+        shoulder_level = (joints["left_shoulder"][1] + joints["right_shoulder"][1]) / 2.0
+        up_cutoff = shoulder_level - config.HANDS_UP_MARGIN
 
-        # ---- State transitions ---------------------------------------
-        if self.state == IDLE:
-            # Keep a slowly-updating baseline of the standing wrist
-            # height (exponential moving average so brief twitches
-            # don't drag it around).
-            if self._idle_wrist_y is None:
-                self._idle_wrist_y = wrist[1]
-            else:
-                self._idle_wrist_y = 0.9 * self._idle_wrist_y + 0.1 * wrist[1]
+        left_up = joints["left_wrist"][1] < up_cutoff
+        right_up = joints["right_wrist"][1] < up_cutoff
+        both_up = left_up and right_up
+        both_down = not left_up and not right_up
+        one_up = left_up != right_up
 
-            # The shot starts when the player "loads": knees bend, the
-            # shooting elbow cocks, or the wrist suddenly drives upward
-            # (catches quick shooters who barely dip).
-            loading = (
-                knee_angle < config.KNEE_BEND_ANGLE
-                or elbow_angle < config.ELBOW_LOADED_ANGLE
-                or wrist_speed_up > config.MIN_WRIST_RISE_SPEED
-            )
-            if loading:
-                self._reset_motion_data()
-                self._start_hip_x = hip_center[0]
-                self._min_knee_angle = knee_angle
-                self._change_state(LOADING, now)
+        events = []
+        events += self._update_shot_and_fake(both_up, both_down, now)
+        events += self._update_layup(one_up, both_down, left_up, now)
+        events += self._update_dribble(joints, shoulder_level, dt, now)
+        events += self._update_stepback(joints, now)
 
-        elif self.state == LOADING:
-            # Record the deepest dip - that's the knee-bend form factor.
-            self._min_knee_angle = min(self._min_knee_angle, knee_angle)
+        # ---- UI snapshot ----------------------------------------------
+        if both_up:
+            posture = "BOTH HANDS UP"
+            progress = min(1.0, (now - self._both_up_since) / config.SHOT_HOLD_TIME)
+        elif one_up:
+            posture = "ONE HAND UP"
+            progress = 0.0
+        else:
+            posture = "HANDS DOWN"
+            progress = 0.0
+        if self._shot_fired:
+            posture = "SHOT RELEASED"
+        self._status = {"posture": posture, "shot_progress": progress}
 
-            if wrist_speed_up > config.MIN_WRIST_RISE_SPEED:
-                # The wrist took off: the shot is going up.
-                self._change_state(RISING, now)
-            elif now - self._state_since > config.LOADING_TIMEOUT:
-                # Loaded up but never shot - just shifting weight.
-                self._change_state(IDLE, now)
-
-        elif self.state == RISING:
-            # Keep collecting form measurements while the arm rises.
-            self._min_knee_angle = min(self._min_knee_angle, knee_angle)
-            self._max_elbow_angle = max(self._max_elbow_angle, elbow_angle)
-            self._tilt_samples.append((shoulder_tilt + hip_tilt) / 2.0)
-
-            self._rise_total_frames += 1
-            if wrist_speed_up > 0:
-                self._rise_up_frames += 1
-
-            if self._idle_wrist_y is not None:
-                rise = self._idle_wrist_y - wrist[1]
-                self._peak_wrist_rise = max(self._peak_wrist_rise, rise)
-            if self._start_hip_x is not None:
-                drift = abs(hip_center[0] - self._start_hip_x)
-                self._max_hip_drift = max(self._max_hip_drift, drift)
-
-            # --- RELEASE check: wrist above the shoulder, arm extended,
-            # and the player actually bent their knees at some point.
-            wrist_above_shoulder = (
-                wrist[1] < shoulder[1] - config.WRIST_ABOVE_SHOULDER_MARGIN
-            )
-            arm_extended = elbow_angle >= config.ELBOW_EXTENDED_ANGLE
-            used_legs = self._min_knee_angle < config.SHOT_REQUIRED_KNEE_ANGLE
-
-            if wrist_above_shoulder and arm_extended and used_legs:
-                event = {
-                    "type": "shot",
-                    "metrics": self._build_shot_metrics(elbow_angle),
-                }
-                self._cooldown_length = config.SHOT_COOLDOWN
-                self._change_state(COOLDOWN, now)
-
-            # --- FAKE check: the wrist clearly rose, is now coming back
-            # DOWN, and the elbow never extended -> pump fake.
-            elif (
-                wrist_speed_up < -config.MIN_WRIST_RISE_SPEED / 2
-                and self._peak_wrist_rise >= config.FAKE_MIN_WRIST_RISE
-                and self._max_elbow_angle <= config.FAKE_MAX_ELBOW_ANGLE
-            ):
-                event = {"type": "fake"}
-                # Short cooldown so the follow-up shot can come right away.
-                self._cooldown_length = config.FAKE_COOLDOWN
-                self._change_state(COOLDOWN, now)
-
-            elif now - self._state_since > config.RISING_TIMEOUT:
-                # Arm hovered without releasing - not a real attempt.
-                self._change_state(IDLE, now)
-
-        return event
+        return events
 
     # ------------------------------------------------------------------
-    def _build_shot_metrics(self, release_elbow_angle):
-        """Package the raw measurements scoring.py needs for this shot."""
-        # Smoothness: what fraction of the rise was actually upward
-        # movement. A clean stroke goes straight up (close to 1.0).
-        if self._rise_total_frames > 0:
-            smoothness = self._rise_up_frames / self._rise_total_frames
-        else:
-            smoothness = 0.0
+    # SHOT and SHOT FAKE share the "raise episode" bookkeeping
+    # ------------------------------------------------------------------
+    def _update_shot_and_fake(self, both_up, both_down, now):
+        events = []
 
-        # Average body tilt during the motion (0 = perfectly level).
-        if self._tilt_samples:
-            avg_tilt = sum(self._tilt_samples) / len(self._tilt_samples)
-        else:
-            avg_tilt = 0.0
+        if both_up:
+            if self._episode_start is None:
+                # Both hands just went up: a new raise episode begins.
+                self._episode_start = now
+                self._shot_fired = False
+            if self._both_up_since is None:
+                self._both_up_since = now
 
-        return {
-            "release_elbow_angle": release_elbow_angle,
-            "min_knee_angle": self._min_knee_angle,
-            "wrist_rise": self._peak_wrist_rise,
-            "avg_tilt": avg_tilt,
-            "hip_drift": self._max_hip_drift,
-            "smoothness": smoothness,
-        }
+            # SHOT: both hands held up continuously for the full hold.
+            held = now - self._both_up_since
+            if not self._shot_fired and held >= config.SHOT_HOLD_TIME:
+                events.append({"type": SHOT})
+                self._shot_fired = True
+        else:
+            # The continuous hold is broken the moment either hand drops.
+            self._both_up_since = None
+
+            if both_down and self._episode_start is not None:
+                # SHOT FAKE: the episode ended below the shoulders before
+                # a shot could fire and within the fake window.
+                quick = (now - self._episode_start) < config.FAKE_MAX_TIME
+                if quick and not self._shot_fired:
+                    events.append({"type": SHOT_FAKE})
+                # Episode over either way; ready for the next raise.
+                self._episode_start = None
+                self._shot_fired = False
+
+        return events
+
+    # ------------------------------------------------------------------
+    def _update_layup(self, one_up, both_down, left_up, now):
+        events = []
+
+        # No layup during a raise episode: dropping one hand out of a
+        # two-hand raise is part of a shot/fake, not a layup.
+        if one_up and self._episode_start is None:
+            if self._one_up_since is None:
+                self._one_up_since = now
+            # The short confirmation filters out the instant where the
+            # second hand is still rising toward a two-hand shot pose.
+            confirmed = now - self._one_up_since >= config.LAYUP_CONFIRM_TIME
+            if confirmed and not self._layup_fired:
+                events.append({"type": LAYUP, "hand": "left" if left_up else "right"})
+                self._layup_fired = True
+        else:
+            self._one_up_since = None
+            if both_down:
+                # The hand came back down: a new layup may start.
+                self._layup_fired = False
+
+        return events
+
+    # ------------------------------------------------------------------
+    def _update_dribble(self, joints, shoulder_level, dt, now):
+        """
+        A dribble "bounce" is a below-shoulder hand reversing its
+        vertical direction after meaningful travel - i.e. pushing the
+        ball down and riding it back up. Each reversal = one event.
+        """
+        events = []
+
+        for side in ("left", "right"):
+            hand = self._dribble[side]
+            wrist_y = joints[f"{side}_wrist"][1]
+            below_shoulder = wrist_y > shoulder_level
+
+            if not below_shoulder:
+                # Hand is up doing something else; restart its tracking.
+                hand["last_y"] = None
+                hand["dir"] = 0
+                continue
+
+            if hand["last_y"] is not None and dt > 0:
+                speed = (wrist_y - hand["last_y"]) / dt  # + = moving down
+                if speed > config.DRIBBLE_MIN_SPEED:
+                    new_dir = 1
+                elif speed < -config.DRIBBLE_MIN_SPEED:
+                    new_dir = -1
+                else:
+                    new_dir = 0   # too slow to call a direction
+
+                if new_dir != 0:
+                    if hand["dir"] == 0:
+                        hand["flip_y"] = wrist_y
+                    elif new_dir != hand["dir"]:
+                        # Direction reversed: did the hand travel enough
+                        # since the LAST reversal to be a real bounce?
+                        amplitude = abs(wrist_y - (hand["flip_y"] or wrist_y))
+                        spaced = now - hand["last_bounce"] >= config.DRIBBLE_MIN_INTERVAL
+                        if amplitude >= config.DRIBBLE_MIN_AMPLITUDE and spaced:
+                            events.append({"type": DRIBBLE, "hand": side})
+                            hand["last_bounce"] = now
+                        hand["flip_y"] = wrist_y
+                    hand["dir"] = new_dir
+
+            hand["last_y"] = wrist_y
+
+        return events
+
+    # ------------------------------------------------------------------
+    def _update_stepback(self, joints, now):
+        """
+        Moving away from the camera makes the whole body smaller on
+        screen. Shoulder width is a stable size proxy, so a quick
+        shrink of the shoulder line = the player stepped back.
+        """
+        events = []
+
+        width = abs(joints["right_shoulder"][0] - joints["left_shoulder"][0])
+        self._width_history.append((now, width))
+        # Keep only the last second of samples.
+        while self._width_history and now - self._width_history[0][0] > 1.0:
+            self._width_history.popleft()
+
+        if now >= self._stepback_ready_at:
+            # Compare against the oldest sample inside the window.
+            for t, old_width in self._width_history:
+                if now - t >= config.STEPBACK_WINDOW:
+                    if old_width > 0 and width < old_width * (1.0 - config.STEPBACK_SHRINK):
+                        events.append({"type": STEPBACK})
+                        self._stepback_ready_at = now + config.STEPBACK_COOLDOWN
+                        self._width_history.clear()
+                    break
+
+        return events
