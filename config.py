@@ -81,9 +81,23 @@ WRIST_ABOVE_SHOULDER_MARGIN = 0.0
 # Filters out slow drifting of the arm.
 MIN_WRIST_RISE_SPEED = 0.15
 
+# A shot only counts if the knees dipped below this angle at SOME point
+# before release. Deliberately generous (almost any dip qualifies) so the
+# game stays forgiving, while the real KNEE_BEND_ANGLE above is what
+# earns form points.
+SHOT_REQUIRED_KNEE_ANGLE = 174
+
+# --- state machine timeouts (seconds) ---
+# If the player loads up but never rises, give up and return to IDLE.
+LOADING_TIMEOUT = 3.0
+# If the wrist rises but never releases or comes back down, reset.
+RISING_TIMEOUT = 2.5
+
 # --- COOLDOWN ---
 # Seconds after a detected shot during which no new shot can start.
 SHOT_COOLDOWN = 1.5
+# Shorter cooldown after a FAKE so the follow-up shot can happen quickly.
+FAKE_COOLDOWN = 0.4
 
 # ==========================================================
 # SHOT FAKE DETECTION
@@ -116,6 +130,28 @@ FORM_EXCELLENT_THRESHOLD = 85   # +1 bonus point at or above this
 FORM_GOOD_THRESHOLD = 70
 FORM_DECENT_THRESHOLD = 50
 
+# --- How raw measurements map to 0.0-1.0 component scores ---
+# Elbow extension: linearly maps release elbow angle from MIN -> MAX
+# onto 0.0 -> 1.0 (a 170-degree arm at release = perfect extension).
+FORM_ELBOW_MIN_ANGLE = 120
+FORM_ELBOW_MAX_ANGLE = 170
+
+# Knee bend: the DEEPEST knee angle during loading. 130 degrees (a real
+# athletic dip) = full credit, 172 (basically standing) = no credit.
+FORM_KNEE_BEST_ANGLE = 130
+FORM_KNEE_WORST_ANGLE = 172
+
+# Vertical rise: how far the wrist rose above its idle height
+# (normalized units). Rising this much earns full credit.
+FORM_FULL_RISE = 0.25
+
+# Balance: average shoulder/hip tilt of this many degrees (or more)
+# during the shot scores zero; perfectly level scores 1.0.
+FORM_MAX_TILT = 25
+# Sideways drift of the hip center (normalized units) that zeroes the
+# drift half of the balance score.
+FORM_MAX_HIP_DRIFT = 0.15
+
 # ==========================================================
 # SHOT SUCCESS PROBABILITY
 # ==========================================================
@@ -140,6 +176,42 @@ FAKE_SHOT_BONUS = 0.10
 # impossible or automatic.
 MIN_SHOT_PROBABILITY = 0.05
 MAX_SHOT_PROBABILITY = 0.90
+
+# ==========================================================
+# DEFENDER SYSTEM
+# ==========================================================
+# Each defender type has a personality expressed as probabilities:
+# - pressure_weights: chance of each stance when pressure is re-rolled
+#   (weights are relative; they're normalized when used)
+# - fake_bite_chance: chance this defender jumps on a shot fake
+DEFENDER_PROFILES = {
+    "LAZY_DEFENDER": {
+        "display_name": "Lazy Defender",
+        "pressure_weights": {"OPEN": 0.60, "LIGHT_CONTEST": 0.30, "HEAVY_CONTEST": 0.10},
+        "fake_bite_chance": 0.50,
+    },
+    "AGGRESSIVE_GUARD": {
+        "display_name": "Aggressive Guard",
+        "pressure_weights": {"OPEN": 0.15, "LIGHT_CONTEST": 0.35, "HEAVY_CONTEST": 0.50},
+        "fake_bite_chance": 0.70,
+    },
+    "DISCIPLINED_DEFENDER": {
+        "display_name": "Disciplined Defender",
+        "pressure_weights": {"OPEN": 0.25, "LIGHT_CONTEST": 0.50, "HEAVY_CONTEST": 0.25},
+        "fake_bite_chance": 0.25,
+    },
+    "BOSS_DEFENDER": {
+        "display_name": "BOSS Defender",
+        "pressure_weights": {"OPEN": 0.10, "LIGHT_CONTEST": 0.30, "HEAVY_CONTEST": 0.60},
+        "fake_bite_chance": 0.15,
+    },
+}
+
+# Regular defenders rotate out after this many seconds on the court.
+DEFENDER_ROTATION_INTERVAL = 12
+
+# How often the current defender re-decides its pressure stance.
+PRESSURE_REROLL_INTERVAL = 3.0
 
 # ==========================================================
 # SCORING (points)
@@ -169,6 +241,9 @@ FATIGUE_MAX_PENALTY = 0.15
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 TARGET_FPS = 30
+
+# How long an action message ("SHOT MADE!", ...) stays on screen.
+MESSAGE_DURATION = 2.5
 
 # Basketball-themed color palette (RGB tuples for Pygame).
 COLOR_BACKGROUND = (18, 18, 24)      # near-black court

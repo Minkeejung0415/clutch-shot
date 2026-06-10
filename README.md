@@ -5,30 +5,36 @@ with your body. Stand in front of your webcam, perform real shooting motions,
 and beat the clock while virtual defenders apply pressure. Built with
 real-time pose detection (MediaPipe + OpenCV) and a Pygame interface.
 
-> **Project status: Phase 1 of 5** — vision system (webcam, pose tracking,
-> joint angles) is complete. Game logic and UI arrive in later phases.
+> **Project status: complete MVP** — all five development phases are done:
+> pose tracking, shot/fake detection, defenders, scoring, and the full
+> Pygame UI.
 
 ---
 
 ## Features
 
 - 🎯 **Real shooting-motion detection** — a state machine tracks your body
-  through LOADING → RISING → RELEASED using live joint angles *(Phase 2)*
-- 🛡️ **Four defender personalities** — from a lazy defender to an
-  end-of-game boss, each applying OPEN / LIGHT / HEAVY pressure *(Phase 4)*
+  through IDLE → LOADING → RISING → RELEASED using live joint angles
+- 🤾 **Shot fakes** — pump fake to bait the defender into the air, then
+  rise and fire within 2 seconds for a wide-open bonus shot
+- 🛡️ **Four defender personalities** — Lazy, Aggressive, Disciplined, and
+  a BOSS who takes over the final 15 seconds, each applying
+  OPEN / LIGHT / HEAVY pressure with its own probabilities
 - 📐 **Form score (0–100)** — elbow extension, knee bend, vertical rise,
-  balance and smoothness, all weighted and tunable *(Phase 4)*
-- 🤾 **Shot fakes** — bait the defender into the air, then rise and fire
-  for a bonus *(Phase 5)*
-- 😮‍💨 **Fatigue system** — spam shots and your percentages drop *(Phase 5)*
+  balance, and smoothness, all weighted and tunable in `config.py`
+- 🎲 **Transparent make/miss math** — every shot shows its computed
+  probability: base + form + pressure − fatigue + fake bonus
+- 😮‍💨 **Fatigue system** — spam shots and your percentages drop; rest to
+  recover
 - 🖥️ **Basketball-styled Pygame dashboard** — webcam + skeleton on the
-  left, live game stats on the right *(Phase 3)*
+  left; timer, score, defender, mini-court, last-shot info, fatigue bar,
+  and action messages on the right
 
 ## Screenshots
 
-*Coming soon — screenshots will be added as each phase lands.*
+*Placeholders — add captures of your own runs here.*
 
-| Phase 1 vision check | Game dashboard | End screen |
+| Start screen | Game dashboard | End screen |
 |---|---|---|
 | _placeholder_ | _placeholder_ | _placeholder_ |
 
@@ -64,20 +70,40 @@ pip install -r requirements.txt
 python main.py
 ```
 
-**Phase 1** opens a webcam window with your pose skeleton drawn on top and
-live joint angles (shooting elbow, knee, shoulder tilt) in the corner.
-Straighten your arm and watch the elbow angle approach 180° — that confirms
-the angle math is working.
+Stand back so your **full body** (head to ankles) is in frame, press
+SPACE, and you have 60 seconds. Dip your knees, rise, and extend your
+shooting arm overhead to shoot. Pump fake (rise without extending, then
+come back down) to bait the defender — if they bite, your next shot
+within 2 seconds is wide open and worth a bonus.
+
+Camera acting up? Run the diagnostic view first:
+
+```bash
+python main.py --vision-check
+```
+
+It shows just the webcam, skeleton, and live joint angles — straighten
+your arm and the elbow reading should approach 180°.
 
 ### Controls
 
 | Key | Action |
 |---|---|
-| `Q` / `ESC` | Quit (Phase 1 preview) |
-| `SPACE` | Start game *(Phase 3)* |
-| `R` | Restart after game over *(Phase 3)* |
+| `SPACE` | Start game (start screen) |
+| `R` | Restart (end screen) |
+| `Q` / `ESC` | Quit at any time |
 
 Left-handed? Open `config.py` and set `DOMINANT_ARM = "left"`.
+
+### Scoring
+
+| Event | Points |
+|---|---|
+| Made shot | 2 |
+| ... while OPEN | +1 |
+| ... within 2s of a defender biting your fake | +1 |
+| ... with EXCELLENT form (85+) | +1 |
+| Missed shot | 0 |
 
 ## Running the tests
 
@@ -85,8 +111,10 @@ Left-handed? Open `config.py` and set `DOMINANT_ARM = "left"`.
 pytest tests/ -v
 ```
 
-The tests cover the pure-math layer (joint angles, midpoints, tilt,
-visibility) and config sanity checks — no camera needed.
+All tests are headless (no camera or game window needed). They cover the
+biomechanics math (angles, midpoints, tilt, visibility), the shot/fake
+state machine driven by synthetic joint data, probability clamping,
+form-score range, defender pressure, fatigue bounds, and point bonuses.
 
 ## How motion detection works
 
@@ -95,13 +123,17 @@ visibility) and config sanity checks — no camera needed.
 2. **Biomechanics helpers** (`vision/biomechanics.py`) turn landmarks into
    numbers: the elbow angle via the vector dot-product formula, knee bend,
    shoulder/hip tilt for balance, and frame-to-frame vertical wrist speed.
-3. **A state machine** (`vision/motion_detector.py`, Phase 2) recognizes a
-   shot: knees bend (LOADING) → wrist rises fast (RISING) → wrist above the
+3. **A state machine** (`vision/motion_detector.py`) recognizes a shot:
+   knees bend (LOADING) → wrist rises fast (RISING) → wrist above the
    shoulder with the elbow extended (RELEASED) → COOLDOWN so one motion
    counts once. A rise that comes back down *without* elbow extension is a
    **shot fake**.
-4. **Game logic** (Phase 4) converts form quality, defender pressure, and
-   fatigue into a transparent make/miss probability.
+4. **Game logic** (`game/scoring.py`, `game/game_manager.py`) converts the
+   raw measurements into a weighted form score, then a make/miss
+   probability:
+   `0.25 base + form/200 + pressure (±0.15/−0.20) − fatigue (≤0.15) +
+   fake bonus (0.10)`, clamped to 5–90%. One random roll decides the
+   result.
 
 All thresholds live in `config.py` and are deliberately forgiving — this is
 a demo, not a shooting clinic.
@@ -110,21 +142,22 @@ a demo, not a shooting clinic.
 
 ```
 clutch-shot/
-├── main.py               # entry point (Phase 1: vision check)
-├── config.py             # every tunable constant
+├── main.py                # entry point: game loop + --vision-check mode
+├── config.py              # every tunable constant
 ├── requirements.txt
 ├── game/
-│   ├── game_manager.py   # round flow, timer, score      (Phase 3+)
-│   ├── defender.py       # defender AI & pressure        (Phase 4+)
-│   ├── scoring.py        # form score, probability, fatigue (Phase 4+)
-│   └── ui.py             # Pygame dashboard              (Phase 3+)
+│   ├── game_manager.py    # game clock, score, shot resolution
+│   ├── defender.py        # defender personalities & pressure
+│   ├── scoring.py         # form score, probability, fatigue, points
+│   └── ui.py              # Pygame dashboard, start/end screens
 ├── vision/
-│   ├── pose_tracker.py   # MediaPipe Pose wrapper        ✅
-│   ├── biomechanics.py   # angle / movement math         ✅
-│   └── motion_detector.py# shot state machine            (Phase 2)
+│   ├── pose_tracker.py    # MediaPipe Pose wrapper
+│   ├── biomechanics.py    # angle / movement math (pure functions)
+│   └── motion_detector.py # IDLE→LOADING→RISING→RELEASED state machine
 └── tests/
-    ├── test_biomechanics.py  ✅
-    └── test_scoring.py       (expands in Phase 4)
+    ├── test_biomechanics.py    # angle/midpoint/tilt math
+    ├── test_motion_detector.py # synthetic shot & fake sequences
+    └── test_scoring.py         # probability, form, defenders, fatigue
 ```
 
 ## Limitations
